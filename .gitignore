@@ -1,0 +1,32 @@
+# CI/CD local artifacts
+artifacts/
+coverage/
+reports/
+*.log
+
+# Temporary CI files
+tmp/
+temp/
+.cache/
+
+# Scripts / Runtime
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
+
+# Local configuration
+*.local
+*.local.*
+config.local.*
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# System
+.DS_Store

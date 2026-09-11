@@ -1,0 +1,70 @@
+name: Validate Terraform
+description: Check Terraform formatting and validate a Terraform root
+
+inputs:
+  working_directory:
+    description: Repository-relative path to the Terraform root
+    required: true
+
+runs:
+  using: composite
+
+  steps:
+    - name: Validate working directory
+      shell: bash
+      env:
+        WORKING_DIRECTORY: ${{ inputs.working_directory }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "$WORKING_DIRECTORY" ]]; then
+          echo "::error::working_directory is empty"
+          exit 1
+        fi
+
+        if [[ "$WORKING_DIRECTORY" == /* || "/$WORKING_DIRECTORY/" == *"/../"* ]]; then
+          echo "::error::working_directory must be a safe repository-relative path"
+          exit 1
+        fi
+
+        if [[ ! -d "$WORKING_DIRECTORY" ]]; then
+          echo "::error::Terraform working directory does not exist: $WORKING_DIRECTORY"
+          exit 1
+        fi
+
+        if ! find "$WORKING_DIRECTORY" \
+          -maxdepth 1 \
+          -type f \
+          -name '*.tf' \
+          -print \
+          -quit |
+          grep -q .; then
+          echo "::error::No Terraform files found in $WORKING_DIRECTORY"
+          exit 1
+        fi
+
+    - name: Terraform fmt
+      shell: bash
+      env:
+        WORKING_DIRECTORY: ${{ inputs.working_directory }}
+      run: |
+        set -euo pipefail
+
+        terraform \
+          "-chdir=${WORKING_DIRECTORY}" \
+          fmt \
+          -check \
+          -diff \
+          -recursive
+
+    - name: Terraform validate
+      shell: bash
+      env:
+        WORKING_DIRECTORY: ${{ inputs.working_directory }}
+      run: |
+        set -euo pipefail
+
+        terraform \
+          "-chdir=${WORKING_DIRECTORY}" \
+          validate \
+          -no-color

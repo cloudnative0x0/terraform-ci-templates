@@ -1,0 +1,340 @@
+name: Reusable Terraform stack detection
+
+on:
+  workflow_call:
+    inputs:
+      stacks_json:
+        description: >-
+          JSON array containing all deployable Terraform stacks.
+          Each stack must define stack_id, working_directory,
+          environment, github_environment and apply_group.
+          The cloud property is optional.
+        required: true
+        type: string
+
+      source_ref:
+        description: Commit SHA or Git ref to inspect
+        required: false
+        type: string
+        default: ""
+
+      shared_paths_json:
+        description: >-
+          Changes under these paths select every registered stack.
+          Paths are matched as literal repository-relative prefixes.
+        required: false
+        type: string
+        default: '[".github",".terraform-version"]'
+
+      force_all:
+        description: Select every registered stack without calculating a diff
+        required: false
+        type: boolean
+        default: false
+
+    outputs:
+      matrix:
+        description: JSON array of selected Terraform stacks
+        value: ${{ jobs.detect.outputs.matrix }}
+
+      has_changes:
+        description: Whether at least one Terraform stack was selected
+        value: ${{ jobs.detect.outputs.has_changes }}
+
+      source_sha:
+        description: Full SHA of the inspected source commit
+        value: ${{ jobs.detect.outputs.source_sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect changed Terraform stacks
+    runs-on: ubuntu-latest
+
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      has_changes: ${{ steps.select.outputs.has_changes }}
+      source_sha: ${{ steps.diff.outputs.source_sha }}
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate stack registry
+        shell: bash
+        env:
+          STACKS_JSON: ${{ inputs.stacks_json }}
+          SHARED_PATHS_JSON: ${{ inputs.shared_paths_json }}
+        run: |
+          set -euo pipefail
+
+          if ! jq -e '
+            type == "array"
+            and length > 0
+            and all(
+              .[];
+              (.stack_id | type == "string" and length > 0)
+              and (.working_directory | type == "string" and length > 0)
+              and (
+                (has("cloud") | not)
+                or (.cloud | type == "string" and length > 0)
+              )
+              and (.environment | type == "string" and length > 0)
+              and (.github_environment | type == "string" and length > 0)
+              and (.apply_group | type == "string" and length > 0)
+              and (
+                (.watch_paths // []) |
+                type == "array"
+                and all(.[]; type == "string" and length > 0)
+              )
+            )
+            and (
+              [.[].stack_id] |
+              length == (unique | length)
+            )
+            and (
+              [.[].working_directory] |
+              length == (unique | length)
+            )
+          ' <<< "$STACKS_JSON" >/dev/null; then
+            echo "::error::stacks_json does not match the required schema"
+            exit 1
+          fi
+
+          if ! jq -e '
+            type == "array"
+            and all(.[]; type == "string" and length > 0)
+          ' <<< "$SHARED_PATHS_JSON" >/dev/null; then
+            echo "::error::shared_paths_json must be an array of non-empty strings"
+            exit 1
+          fi
+
+          while IFS= read -r path; do
+            if [[ "$path" == /* ]]; then
+              echo "::error::Repository path must be relative: $path"
+              exit 1
+            fi
+
+            if [[ "/$path/" == *"/../"* ]]; then
+              echo "::error::Repository path must not contain '..': $path"
+              exit 1
+            fi
+          done < <(
+            {
+              jq -r '.[].working_directory' <<< "$STACKS_JSON"
+              jq -r '.[].watch_paths[]?' <<< "$STACKS_JSON"
+              jq -r '.[]' <<< "$SHARED_PATHS_JSON"
+            } | sort -u
+          )
+
+      - name: Determine diff
+        id: diff
+        shell: bash
+        env:
+          FORCE_ALL: ${{ inputs.force_all }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          current_sha="$(git rev-parse HEAD)"
+          echo "source_sha=$current_sha" >> "$GITHUB_OUTPUT"
+
+          if [[ "$FORCE_ALL" == "true" ]]; then
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base_sha=""
+
+          case "$EVENT_NAME" in
+            pull_request)
+              base_sha="$PR_BASE_SHA"
+              ;;
+
+            push)
+              base_sha="$PUSH_BEFORE_SHA"
+              ;;
+
+            *)
+              echo "::notice::Event '$EVENT_NAME' has no diff base; selecting all registered stacks"
+              echo "mode=full" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]]; then
+            echo "::notice::No usable diff base; selecting all registered stacks"
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+            echo "::notice::Diff base '$base_sha' is unavailable locally; selecting all registered stacks"
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed_files="$(
+            git diff \
+              --name-only \
+              --diff-filter=ACMRDTUXB \
+              "$base_sha" \
+              "$current_sha"
+          )"
+
+          if [[ -z "$changed_files" ]]; then
+            echo "mode=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "mode=diff" >> "$GITHUB_OUTPUT"
+
+          delimiter="CHANGED_FILES_$(openssl rand -hex 8)"
+
+          {
+            echo "changed_files<<$delimiter"
+            printf '%s\n' "$changed_files"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Select Terraform stacks
+        id: select
+        shell: bash
+        env:
+          MODE: ${{ steps.diff.outputs.mode }}
+          CHANGED_FILES: ${{ steps.diff.outputs.changed_files }}
+          STACKS_JSON: ${{ inputs.stacks_json }}
+          SHARED_PATHS_JSON: ${{ inputs.shared_paths_json }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$MODE" == "none" ]]; then
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          path_matches_prefix() {
+            local file="$1"
+            local prefix="${2%/}"
+
+            [[ "$file" == "$prefix" || "$file" == "$prefix/"* ]]
+          }
+
+          mapfile -t changed_files < <(
+            printf '%s\n' "$CHANGED_FILES" |
+              sed '/^$/d'
+          )
+
+          shared_change=false
+
+          if [[ "$MODE" == "diff" ]]; then
+            mapfile -t shared_paths < <(
+              jq -r '.[]' <<< "$SHARED_PATHS_JSON"
+            )
+
+            for file in "${changed_files[@]}"; do
+              for prefix in "${shared_paths[@]}"; do
+                if path_matches_prefix "$file" "$prefix"; then
+                  shared_change=true
+                  break 2
+                fi
+              done
+            done
+          fi
+
+          selected='[]'
+          stack_count="$(jq 'length' <<< "$STACKS_JSON")"
+
+          for ((index = 0; index < stack_count; index++)); do
+            stack="$(jq -c ".[$index]" <<< "$STACKS_JSON")"
+            stack_id="$(jq -r '.stack_id' <<< "$stack")"
+            working_directory="$(jq -r '.working_directory' <<< "$stack")"
+
+            include=false
+
+            if [[ "$MODE" == "full" || "$shared_change" == "true" ]]; then
+              include=true
+            else
+              mapfile -t watch_paths < <(
+                jq -r '
+                  if ((.watch_paths // []) | length) > 0
+                  then .watch_paths[]
+                  else .working_directory
+                  end
+                ' <<< "$stack"
+              )
+
+              for file in "${changed_files[@]}"; do
+                for prefix in "${watch_paths[@]}"; do
+                  if path_matches_prefix "$file" "$prefix"; then
+                    include=true
+                    break 2
+                  fi
+                done
+              done
+            fi
+
+            if [[ "$include" != "true" ]]; then
+              continue
+            fi
+
+            if [[ ! -d "$working_directory" ]]; then
+              echo "::error::Terraform root for stack '$stack_id' does not exist: $working_directory"
+              exit 1
+            fi
+
+            if ! find "$working_directory" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.tf' \
+              -print \
+              -quit |
+              grep -q .; then
+              echo "::error::No Terraform files found for stack '$stack_id': $working_directory"
+              exit 1
+            fi
+
+            stack="$(
+              jq -c '
+                if has("safe_dir")
+                then .
+                else . + {
+                  safe_dir: (
+                    .working_directory |
+                    gsub("[^A-Za-z0-9_.-]"; "_")
+                  )
+                }
+                end
+              ' <<< "$stack"
+            )"
+
+            selected="$(
+              jq -cn \
+                --argjson current "$selected" \
+                --argjson stack "$stack" \
+                '$current + [$stack]'
+            )"
+          done
+
+          selected="$(jq -c 'sort_by(.stack_id)' <<< "$selected")"
+          selected_count="$(jq 'length' <<< "$selected")"
+
+          echo "Selected Terraform stacks:"
+          jq . <<< "$selected"
+
+          echo "matrix=$selected" >> "$GITHUB_OUTPUT"
+
+          if [[ "$selected_count" -gt 0 ]]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi

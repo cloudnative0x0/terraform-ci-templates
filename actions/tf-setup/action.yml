@@ -1,0 +1,49 @@
+name: Setup Terraform
+description: Install and verify a specific Terraform CLI version
+
+inputs:
+  terraform_version:
+    description: Exact Terraform CLI version to install
+    required: false
+    default: "1.15.7"
+
+runs:
+  using: composite
+
+  steps:
+    - name: Validate Terraform version
+      shell: bash
+      env:
+        TERRAFORM_VERSION: ${{ inputs.terraform_version }}
+      run: |
+        set -euo pipefail
+
+        if ! [[ "$TERRAFORM_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::terraform_version must be an exact semantic version, got: $TERRAFORM_VERSION"
+          exit 1
+        fi
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@main
+      with:
+        terraform_version: ${{ inputs.terraform_version }}
+        terraform_wrapper: false
+
+    - name: Verify Terraform installation
+      shell: bash
+      env:
+        EXPECTED_TERRAFORM_VERSION: ${{ inputs.terraform_version }}
+      run: |
+        set -euo pipefail
+
+        installed_version="$(
+          terraform version -json |
+            jq -r '.terraform_version'
+        )"
+
+        if [[ "$installed_version" != "$EXPECTED_TERRAFORM_VERSION" ]]; then
+          echo "::error::Expected Terraform $EXPECTED_TERRAFORM_VERSION, installed $installed_version"
+          exit 1
+        fi
+
+        terraform version

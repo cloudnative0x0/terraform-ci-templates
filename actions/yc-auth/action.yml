@@ -1,0 +1,128 @@
+name: Authenticate to Yandex Cloud via OIDC
+description: Exchange a GitHub OIDC token for a temporary Yandex Cloud IAM token
+
+inputs:
+  github_org:
+    description: GitHub organization used as the OIDC audience
+    required: true
+
+  service_account_id:
+    description: Yandex Cloud service account ID receiving the IAM token
+    required: true
+
+runs:
+  using: composite
+
+  steps:
+    - name: Exchange GitHub OIDC token
+      shell: bash
+      env:
+        GITHUB_ORG: ${{ inputs.github_org }}
+        YC_SERVICE_ACCOUNT_ID: ${{ inputs.service_account_id }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "$GITHUB_ORG" ]]; then
+          echo "::error::github_org is empty"
+          exit 1
+        fi
+
+        if [[ -z "$YC_SERVICE_ACCOUNT_ID" ]]; then
+          echo "::error::service_account_id is empty"
+          exit 1
+        fi
+
+        if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+          echo "::error::ACTIONS_ID_TOKEN_REQUEST_URL is unavailable; the job requires id-token: write"
+          exit 1
+        fi
+
+        if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
+          echo "::error::ACTIONS_ID_TOKEN_REQUEST_TOKEN is unavailable; the job requires id-token: write"
+          exit 1
+        fi
+
+        github_response_file="$(mktemp)"
+        yandex_response_file="$(mktemp)"
+
+        cleanup() {
+          rm -f "$github_response_file" "$yandex_response_file"
+        }
+
+        trap cleanup EXIT
+
+        oidc_audience="https://github.com/${GITHUB_ORG}"
+
+        encoded_audience="$(
+          jq -rn \
+            --arg audience "$oidc_audience" \
+            '$audience | @uri'
+        )"
+
+        request_separator="?"
+
+        if [[ "$ACTIONS_ID_TOKEN_REQUEST_URL" == *"?"* ]]; then
+          request_separator="&"
+        fi
+
+        github_http_code="$(
+          curl \
+            --silent \
+            --show-error \
+            --location \
+            --output "$github_response_file" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}${request_separator}audience=${encoded_audience}"
+        )"
+
+        if [[ "$github_http_code" != "200" ]]; then
+          echo "::error::GitHub OIDC token request failed with HTTP $github_http_code"
+          exit 1
+        fi
+
+        github_oidc_token="$(
+          jq -er '
+            .value |
+            select(type == "string" and length > 0)
+          ' "$github_response_file"
+        )"
+
+        echo "::add-mask::$github_oidc_token"
+
+        yandex_http_code="$(
+          curl \
+            --silent \
+            --show-error \
+            --location \
+            --output "$yandex_response_file" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange' \
+            --data-urlencode 'requested_token_type=urn:ietf:params:oauth:token-type:access_token' \
+            --data-urlencode "audience=${YC_SERVICE_ACCOUNT_ID}" \
+            --data-urlencode "subject_token=${github_oidc_token}" \
+            --data-urlencode 'subject_token_type=urn:ietf:params:oauth:token-type:id_token' \
+            'https://auth.yandex.cloud/oauth/token'
+        )"
+
+        if [[ "$yandex_http_code" != "200" ]]; then
+          echo "::error::Yandex Cloud token exchange failed with HTTP $yandex_http_code"
+          exit 1
+        fi
+
+        yc_token="$(
+          jq -er '
+            .access_token |
+            select(type == "string" and length > 0)
+          ' "$yandex_response_file"
+        )"
+
+        if [[ "$yc_token" == *$'\n'* ]]; then
+          echo "::error::Yandex Cloud returned an invalid IAM token"
+          exit 1
+        fi
+
+        echo "::add-mask::$yc_token"
+        printf 'YC_TOKEN=%s\n' "$yc_token" >> "$GITHUB_ENV"

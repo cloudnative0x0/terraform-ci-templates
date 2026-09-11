@@ -1,0 +1,97 @@
+name: Terraform repository guard
+description: Detect committed tfvars and credentials in a Terraform repository
+
+inputs:
+  working_directory:
+    description: Repository-relative directory to scan
+    required: false
+    default: "."
+
+runs:
+  using: composite
+
+  steps:
+    - name: Validate working directory
+      shell: bash
+      env:
+        WORKING_DIRECTORY: ${{ inputs.working_directory }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "$WORKING_DIRECTORY" ]]; then
+          echo "::error::working_directory is empty"
+          exit 1
+        fi
+
+        if [[ "$WORKING_DIRECTORY" == /* || "/$WORKING_DIRECTORY/" == *"/../"* ]]; then
+          echo "::error::working_directory must be a safe repository-relative path"
+          exit 1
+        fi
+
+        if [[ ! -d "$WORKING_DIRECTORY" ]]; then
+          echo "::error::Directory does not exist: $WORKING_DIRECTORY"
+          exit 1
+        fi
+
+    - name: Block committed tfvars
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        set -euo pipefail
+
+        tracked_tfvars="$(
+          git ls-files |
+            grep -E '(^|/)(terraform\.tfvars|.*\.auto\.tfvars(\.json)?|.*\.tfvars(\.json)?)$' |
+            grep -vE '\.(example|sample)$' \
+            || true
+        )"
+
+        if [[ -n "$tracked_tfvars" ]]; then
+          echo "::error::Committed tfvars files are not allowed:"
+          printf '%s\n' "$tracked_tfvars"
+          exit 1
+        fi
+
+    - name: Install gitleaks
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        version="8.30.1"
+        archive="gitleaks_${version}_linux_x64.tar.gz"
+        expected_sha256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        install_directory="${RUNNER_TEMP}/gitleaks-${version}"
+
+        mkdir -p "$install_directory"
+
+        curl \
+          --fail \
+          --silent \
+          --show-error \
+          --location \
+          "https://github.com/gitleaks/gitleaks/releases/download/v${version}/${archive}" \
+          --output "${install_directory}/${archive}"
+
+        printf '%s  %s\n' \
+          "$expected_sha256" \
+          "${install_directory}/${archive}" |
+          sha256sum --check
+
+        tar \
+          -xzf "${install_directory}/${archive}" \
+          -C "$install_directory" \
+          gitleaks
+
+        chmod +x "${install_directory}/gitleaks"
+        printf '%s\n' "$install_directory" >> "$GITHUB_PATH"
+
+    - name: Scan repository with gitleaks
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        set -euo pipefail
+
+        gitleaks git . \
+          --redact \
+          --verbose \
+          --exit-code 1

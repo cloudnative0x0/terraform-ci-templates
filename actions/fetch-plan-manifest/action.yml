@@ -1,0 +1,99 @@
+name: Fetch Terraform plan manifest
+description: Download and validate a Terraform plan manifest
+
+inputs:
+  plan_run_id:
+    description: Workflow run ID that created the Terraform plans
+    required: true
+
+  expected_workflow_sha:
+    description: Workflow head SHA returned by verify-workflow-run
+    required: true
+
+  expected_plan_kind:
+    description: Expected manifest kind
+    required: true
+
+  github_token:
+    description: GitHub token with actions read permission
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  matrix:
+    description: Terraform stack matrix from the manifest
+    value: ${{ steps.read.outputs.matrix }}
+
+  terraform_version:
+    description: Terraform version used to create the plans
+    value: ${{ steps.read.outputs.terraform_version }}
+
+  source_sha:
+    description: Full commit SHA of the Terraform source used to create the plans
+    value: ${{ steps.read.outputs.source_sha }}
+
+runs:
+  using: composite
+
+  steps:
+    - name: Download plan manifest
+      uses: actions/download-artifact@v8
+      with:
+        name: terraform-plan-manifest-${{ inputs.plan_run_id }}
+        run-id: ${{ inputs.plan_run_id }}
+        github-token: ${{ inputs.github_token }}
+        path: .terraform-plan-manifest
+
+    - name: Validate plan manifest
+      id: read
+      shell: bash
+      env:
+        PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+        EXPECTED_WORKFLOW_SHA: ${{ inputs.expected_workflow_sha }}
+        EXPECTED_PLAN_KIND: ${{ inputs.expected_plan_kind }}
+      run: |
+        set -euo pipefail
+
+        manifest=".terraform-plan-manifest/terraform-plan-manifest.json"
+
+        if [[ ! -s "$manifest" ]]; then
+          echo "::error::Terraform plan manifest is missing"
+          exit 1
+        fi
+
+        if ! jq -e \
+          --arg run_id "$PLAN_RUN_ID" \
+          --arg repository "$GITHUB_REPOSITORY" \
+          --arg workflow_sha "$EXPECTED_WORKFLOW_SHA" \
+          --arg plan_kind "$EXPECTED_PLAN_KIND" \
+          '
+            .schema_version == "2"
+            and .run_id == $run_id
+            and .repository == $repository
+            and .workflow_sha == $workflow_sha
+            and (.source_sha | type == "string" and test("^[0-9a-f]{40}$"))
+            and .plan_kind == $plan_kind
+            and (.terraform_version | type == "string" and length > 0)
+            and (
+              .stacks |
+              type == "array"
+              and length > 0
+              and all(
+                .[];
+                (.stack_id | type == "string" and length > 0)
+                and (.working_directory | type == "string" and length > 0)
+                and (.safe_dir | type == "string" and length > 0)
+                and (.environment | type == "string" and length > 0)
+                and (.github_environment | type == "string" and length > 0)
+                and (.apply_group | type == "string" and length > 0)
+                and (.plan_artifact | type == "string" and length > 0)
+              )
+            )
+          ' "$manifest" >/dev/null; then
+          echo "::error::Terraform plan manifest validation failed"
+          exit 1
+        fi
+
+        echo "matrix=$(jq -c '.stacks' "$manifest")" >> "$GITHUB_OUTPUT"
+        echo "terraform_version=$(jq -r '.terraform_version' "$manifest")" >> "$GITHUB_OUTPUT"
+        echo "source_sha=$(jq -r '.source_sha' "$manifest")" >> "$GITHUB_OUTPUT"

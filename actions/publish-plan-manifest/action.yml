@@ -1,0 +1,106 @@
+name: Publish Terraform plan manifest
+description: Publish metadata for all Terraform plans created by the current workflow run
+
+inputs:
+  matrix_json:
+    description: JSON array of successfully planned Terraform stacks
+    required: true
+
+  plan_kind:
+    description: Plan workflow kind, for example global or layers
+    required: true
+
+  terraform_version:
+    description: Exact Terraform CLI version used to create plans
+    required: true
+
+  source_sha:
+    description: Full commit SHA of the Terraform source used to create the plans
+    required: true
+
+  retention_days:
+    description: Manifest retention period
+    required: false
+    default: "7"
+
+runs:
+  using: composite
+
+  steps:
+    - name: Create plan manifest
+      shell: bash
+      env:
+        MATRIX_JSON: ${{ inputs.matrix_json }}
+        PLAN_KIND: ${{ inputs.plan_kind }}
+        TERRAFORM_VERSION: ${{ inputs.terraform_version }}
+        SOURCE_SHA: ${{ inputs.source_sha }}
+      run: |
+        set -euo pipefail
+
+        if ! jq -e '
+          type == "array"
+          and length > 0
+          and all(
+            .[];
+            (.stack_id | type == "string" and length > 0)
+            and (.working_directory | type == "string" and length > 0)
+            and (.safe_dir | type == "string" and length > 0)
+            and (.github_environment | type == "string" and length > 0)
+            and (.apply_group | type == "string" and length > 0)
+          )
+        ' <<< "$MATRIX_JSON" >/dev/null; then
+          echo "::error::matrix_json is empty or invalid"
+          exit 1
+        fi
+
+        if ! [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::source_sha must be a full 40-character commit SHA"
+          exit 1
+        fi
+
+        jq -n \
+          --arg schema_version "2" \
+          --arg run_id "$GITHUB_RUN_ID" \
+          --arg repository "$GITHUB_REPOSITORY" \
+          --arg workflow_sha "$GITHUB_SHA" \
+          --arg source_sha "$SOURCE_SHA" \
+          --arg git_ref "$GITHUB_REF" \
+          --arg event_name "$GITHUB_EVENT_NAME" \
+          --arg workflow "$GITHUB_WORKFLOW" \
+          --arg plan_kind "$PLAN_KIND" \
+          --arg terraform_version "$TERRAFORM_VERSION" \
+          --argjson stacks "$MATRIX_JSON" \
+          '{
+            schema_version: $schema_version,
+            run_id: $run_id,
+            repository: $repository,
+            workflow_sha: $workflow_sha,
+            source_sha: $source_sha,
+            git_ref: $git_ref,
+            event_name: $event_name,
+            workflow: $workflow,
+            plan_kind: $plan_kind,
+            terraform_version: $terraform_version,
+            stacks: (
+              $stacks |
+              map(
+                . + {
+                  plan_artifact: (
+                    "tfplan-" +
+                    .safe_dir +
+                    "-" +
+                    $run_id
+                  )
+                }
+              )
+            )
+          }' > terraform-plan-manifest.json
+
+        jq . terraform-plan-manifest.json
+
+    - name: Upload plan manifest
+      uses: actions/upload-artifact@v7
+      with:
+        name: terraform-plan-manifest-${{ github.run_id }}
+        path: terraform-plan-manifest.json
+        retention-days: ${{ inputs.retention_days }}

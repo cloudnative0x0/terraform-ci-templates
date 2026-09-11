@@ -1,0 +1,51 @@
+name: Reusable Terraform validation
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Commit SHA or Git ref to validate
+        required: true
+        type: string
+
+      working_directory:
+        description: Repository-relative Terraform root
+        required: true
+        type: string
+
+      terraform_version:
+        description: Exact Terraform CLI version
+        required: false
+        type: string
+        default: "1.15.7"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate ${{ inputs.working_directory }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: Snowstack-AI/tf-ci-templates/.github/actions/tf-setup@main
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Terraform init without backend
+        uses: Snowstack-AI/tf-ci-templates/.github/actions/tf-init@main
+        with:
+          working_directory: ${{ inputs.working_directory }}
+          backend: "false"
+
+      - name: Terraform validate
+        uses: Snowstack-AI/tf-ci-templates/.github/actions/tf-validate@main
+        with:
+          working_directory: ${{ inputs.working_directory }}

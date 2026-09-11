@@ -1,0 +1,123 @@
+name: Export Terraform environment
+description: Export S3 backend credentials and non-secret Terraform input variables
+
+inputs:
+  tf_state_access_key_id:
+    description: Static access key ID used by the Terraform S3 backend
+    required: true
+
+  tf_state_secret_access_key:
+    description: Static secret access key used by the Terraform S3 backend
+    required: true
+
+  terraform_vars_json:
+    description: >-
+      JSON object whose properties are exported as TF_VAR_<property>.
+      String values are exported as strings; objects and arrays are
+      exported as compact JSON.
+    required: false
+    default: '{}'
+
+runs:
+  using: composite
+
+  steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        TF_STATE_ACCESS_KEY_ID: ${{ inputs.tf_state_access_key_id }}
+        TF_STATE_SECRET_ACCESS_KEY: ${{ inputs.tf_state_secret_access_key }}
+        TERRAFORM_VARS_JSON: ${{ inputs.terraform_vars_json }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "$TF_STATE_ACCESS_KEY_ID" ]]; then
+          echo "::error::tf_state_access_key_id is empty"
+          exit 1
+        fi
+
+        if [[ -z "$TF_STATE_SECRET_ACCESS_KEY" ]]; then
+          echo "::error::tf_state_secret_access_key is empty"
+          exit 1
+        fi
+
+        if [[ "$TF_STATE_ACCESS_KEY_ID" == *$'\n'* ]]; then
+          echo "::error::tf_state_access_key_id must not contain newlines"
+          exit 1
+        fi
+
+        if [[ "$TF_STATE_SECRET_ACCESS_KEY" == *$'\n'* ]]; then
+          echo "::error::tf_state_secret_access_key must not contain newlines"
+          exit 1
+        fi
+
+        if ! jq -e '
+          type == "object"
+          and all(
+            keys[];
+            test("^[A-Za-z_][A-Za-z0-9_]*$")
+          )
+        ' <<< "$TERRAFORM_VARS_JSON" >/dev/null; then
+          echo "::error::terraform_vars_json must be a JSON object with valid Terraform variable names"
+          exit 1
+        fi
+
+    - name: Export S3 backend credentials
+      shell: bash
+      env:
+        TF_STATE_ACCESS_KEY_ID: ${{ inputs.tf_state_access_key_id }}
+        TF_STATE_SECRET_ACCESS_KEY: ${{ inputs.tf_state_secret_access_key }}
+      run: |
+        set -euo pipefail
+
+        echo "::add-mask::$TF_STATE_ACCESS_KEY_ID"
+        echo "::add-mask::$TF_STATE_SECRET_ACCESS_KEY"
+
+        {
+          printf 'AWS_ACCESS_KEY_ID=%s\n' "$TF_STATE_ACCESS_KEY_ID"
+          printf 'AWS_SECRET_ACCESS_KEY=%s\n' "$TF_STATE_SECRET_ACCESS_KEY"
+        } >> "$GITHUB_ENV"
+
+    - name: Export Terraform variables
+      shell: bash
+      env:
+        TERRAFORM_VARS_JSON: ${{ inputs.terraform_vars_json }}
+      run: |
+        set -euo pipefail
+
+        mapfile -t variable_names < <(
+          jq -r 'keys[]' <<< "$TERRAFORM_VARS_JSON"
+        )
+
+        for variable_name in "${variable_names[@]}"; do
+          value_type="$(
+            jq -r \
+              --arg variable_name "$variable_name" \
+              '.[$variable_name] | type' \
+              <<< "$TERRAFORM_VARS_JSON"
+          )"
+
+          if [[ "$value_type" == "string" ]]; then
+            variable_value="$(
+              jq -r \
+                --arg variable_name "$variable_name" \
+                '.[$variable_name]' \
+                <<< "$TERRAFORM_VARS_JSON"
+            )"
+          else
+            variable_value="$(
+              jq -c \
+                --arg variable_name "$variable_name" \
+                '.[$variable_name]' \
+                <<< "$TERRAFORM_VARS_JSON"
+            )"
+          fi
+
+          delimiter="TF_VAR_EOF_$(openssl rand -hex 12)"
+
+          {
+            printf 'TF_VAR_%s<<%s\n' "$variable_name" "$delimiter"
+            printf '%s\n' "$variable_value"
+            printf '%s\n' "$delimiter"
+          } >> "$GITHUB_ENV"
+        done

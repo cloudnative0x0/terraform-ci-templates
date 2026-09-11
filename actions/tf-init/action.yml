@@ -1,0 +1,72 @@
+name: Terraform init
+description: Initialize a Terraform root using the committed dependency lock file
+
+inputs:
+  working_directory:
+    description: Repository-relative path to the Terraform root
+    required: true
+
+  backend:
+    description: Whether Terraform should initialize its configured backend
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+
+  steps:
+    - name: Validate init inputs
+      shell: bash
+      env:
+        WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        BACKEND_ENABLED: ${{ inputs.backend }}
+      run: |
+        set -euo pipefail
+
+        if [[ -z "$WORKING_DIRECTORY" ]]; then
+          echo "::error::working_directory is empty"
+          exit 1
+        fi
+
+        if [[ "$WORKING_DIRECTORY" == /* || "/$WORKING_DIRECTORY/" == *"/../"* ]]; then
+          echo "::error::working_directory must be a safe repository-relative path"
+          exit 1
+        fi
+
+        if [[ ! -d "$WORKING_DIRECTORY" ]]; then
+          echo "::error::Terraform working directory does not exist: $WORKING_DIRECTORY"
+          exit 1
+        fi
+
+        if [[ "$BACKEND_ENABLED" != "true" && "$BACKEND_ENABLED" != "false" ]]; then
+          echo "::error::backend must be either 'true' or 'false'"
+          exit 1
+        fi
+
+        if [[ ! -f "$WORKING_DIRECTORY/.terraform.lock.hcl" ]]; then
+          echo "::error::Committed .terraform.lock.hcl is missing in $WORKING_DIRECTORY"
+          exit 1
+        fi
+
+    - name: Terraform init
+      shell: bash
+      env:
+        WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        BACKEND_ENABLED: ${{ inputs.backend }}
+      run: |
+        set -euo pipefail
+
+        init_arguments=(
+          "-input=false"
+          "-no-color"
+          "-lockfile=readonly"
+        )
+
+        if [[ "$BACKEND_ENABLED" == "false" ]]; then
+          init_arguments+=("-backend=false")
+        fi
+
+        terraform \
+          "-chdir=${WORKING_DIRECTORY}" \
+          init \
+          "${init_arguments[@]}"

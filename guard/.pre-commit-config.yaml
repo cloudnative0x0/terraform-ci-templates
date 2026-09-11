@@ -1,0 +1,22 @@
+repos:
+  - repo: local
+    hooks:
+      - id: block-tfvars-json
+        name: Block committing *.auto.tfvars.json
+        language: system
+        files: '\.auto\.tfvars\.json$'
+        entry: |
+          bash -c 'echo "ERROR: *.auto.tfvars.json must never be committed."; exit 1'
+
+      - id: block-tfvars
+        name: Block committing terraform.tfvars / *.tfvars
+        language: system
+        files: '(^|/)(terraform\.tfvars|.*\.tfvars)$'
+        exclude: '\.tfvars\.example$'
+        entry: |
+          bash -c 'echo "ERROR: .tfvars files must never be committed."; exit 1'
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
